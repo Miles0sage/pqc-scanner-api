@@ -199,6 +199,68 @@ async def scan_text(body: ScanTextRequest, request: Request):
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+@app.get("/badge/{owner}/{repo}.svg")
+async def badge(owner: str, repo: str):
+    """Return a shields.io-style SVG badge with quantum grade."""
+    # Simple in-memory cache (1 hour TTL)
+    cache_key = f"{owner}/{repo}"
+    if not hasattr(badge, "_cache"):
+        badge._cache = {}
+
+    cached = badge._cache.get(cache_key)
+    if cached and (time.time() - cached["ts"]) < 3600:
+        grade, color = cached["grade"], cached["color"]
+    else:
+        tmp_dir = tempfile.mkdtemp(prefix="pqc_badge_")
+        try:
+            url = f"https://github.com/{owner}/{repo}"
+            _clone_repo(url, tmp_dir)
+            result = scan_codebase(tmp_dir)
+            score = result.get("risk_score", 100)
+            if score <= 5:
+                grade = "A+"
+            elif score <= 10:
+                grade = "A"
+            elif score <= 25:
+                grade = "B"
+            elif score <= 50:
+                grade = "C"
+            elif score <= 75:
+                grade = "D"
+            else:
+                grade = "F"
+
+            colors = {
+                "A+": "#4c1", "A": "#4c1", "B": "#a4a61d",
+                "C": "#dfb317", "D": "#fe7d37", "F": "#e05d44",
+            }
+            color = colors.get(grade, "#e05d44")
+            badge._cache[cache_key] = {"grade": grade, "color": color, "ts": time.time()}
+        except Exception:
+            grade, color = "?", "#9f9f9f"
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    svg = f'''<svg xmlns="http://www.w3.org/2000/svg" width="130" height="20" role="img">
+  <linearGradient id="s" x2="0" y2="100%"><stop offset="0" stop-color="#bbb" stop-opacity=".1"/><stop offset="1" stop-opacity=".1"/></linearGradient>
+  <clipPath id="r"><rect width="130" height="20" rx="3" fill="#fff"/></clipPath>
+  <g clip-path="url(#r)">
+    <rect width="78" height="20" fill="#555"/>
+    <rect x="78" width="52" height="20" fill="{color}"/>
+    <rect width="130" height="20" fill="url(#s)"/>
+  </g>
+  <g fill="#fff" text-anchor="middle" font-family="Verdana,Geneva,DejaVu Sans,sans-serif" text-rendering="geometricPrecision" font-size="110">
+    <text x="400" y="150" fill="#010101" fill-opacity=".3" transform="scale(.1)"  textLength="680">PQC Grade</text>
+    <text x="400" y="140" transform="scale(.1)" textLength="680">PQC Grade</text>
+    <text x="1035" y="150" fill="#010101" fill-opacity=".3" transform="scale(.1)" textLength="370" font-weight="bold">{grade}</text>
+    <text x="1035" y="140" transform="scale(.1)" textLength="370" font-weight="bold">{grade}</text>
+  </g>
+</svg>'''
+
+    from fastapi.responses import Response
+    return Response(content=svg, media_type="image/svg+xml", headers={"Cache-Control": "max-age=3600"})
+
+
 # ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
