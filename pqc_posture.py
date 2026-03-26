@@ -11,8 +11,9 @@ import re
 import json
 import hashlib
 import time
+import fnmatch
 from dataclasses import dataclass, asdict
-from typing import List, Dict
+from typing import List, Dict, Optional, Set
 from collections import Counter
 
 
@@ -52,6 +53,8 @@ CRYPTO_PATTERNS = {
             r'RsaPublicKey::from',  # Rust rsa crate
             r'RSA_2048',  # AWS KMS key spec
             r'RSA_4096',  # AWS KMS key spec
+            r'algorithm\s*=\s*"RSA"',  # Terraform/config: algorithm = "RSA"
+            r'key_type\s*=\s*"RSA"',  # Config: key_type = "RSA"
         ],
         "category": "key_exchange",
         "risk": "CRITICAL",
@@ -240,6 +243,7 @@ CRYPTO_PATTERNS = {
             r'paramiko\.ECDSAKey',
             r'ssh\.ParsePrivateKey',  # Go SSH
             r'kex_algorithms.*diffie-hellman',
+            r'KexAlgorithms.*diffie-hellman',  # sshd_config KexAlgorithms directive
         ],
         "category": "key_exchange",
         "risk": "CRITICAL",
@@ -258,6 +262,10 @@ CRYPTO_PATTERNS = {
             r'x509\.CreateCertificate',  # Go x509
             r'certbot.*--rsa-key-size',  # Let's Encrypt RSA
             r'CERTIFICATE_VERIFY_FAILED',  # cert validation
+            r'openssl\s+req',  # openssl req (any form)
+            r'certbot.*--rsa-key-size',  # Let's Encrypt RSA key size
+            r'keytool.*-genkeypair',  # Java keytool (any algo)
+            r'openssl_privatekey',  # Ansible crypto module
         ],
         "category": "signature",
         "risk": "HIGH",
@@ -292,7 +300,7 @@ CRYPTO_PATTERNS = {
             r'"bcrypt"',  # npm bcrypt (not quantum-broken but track)
             r'bouncycastle',  # Java crypto provider
             r'jasypt',  # Java encryption
-            r'"ring"',  # Rust crypto crate
+            r'ring::',  # Rust ring crate (ring::signature, ring::rand)
             r'golang\.org/x/crypto/ssh',  # Go SSH crypto
             r'golang\.org/x/crypto/ed25519',  # Go Ed25519
         ],
@@ -343,7 +351,10 @@ SKIP_DIRS = {'.git', 'node_modules', '__pycache__', '.venv', 'venv', 'dist',
 SCAN_EXTENSIONS = {'.py', '.js', '.ts', '.jsx', '.tsx', '.java', '.go', '.rs',
                    '.rb', '.php', '.cs', '.c', '.cpp', '.h', '.yaml', '.yml',
                    '.toml', '.cfg', '.ini', '.conf', '.tf', '.hcl', '.json5',
-                   '.properties', '.xml', '.gradle', '.env.example'}
+                   '.properties', '.xml', '.gradle', '.env.example',
+                   '.sh', '.bash', '.zsh',  # Shell scripts (openssl, ssh-keygen, certbot)
+                   '.env', '.txt',  # Config files (.env) and dependency files (requirements.txt)
+                   }
 
 # Test file indicators — findings here are LOWER priority
 TEST_INDICATORS = {'test_', '_test.', 'tests/', 'test/', 'spec/', '_spec.',
@@ -367,7 +378,9 @@ def _context_risk_multiplier(finding_risk: str, filepath: str, line_content: str
         return demoted[finding_risk], "test"
 
     # Comments / docstrings mentioning crypto aren't real usage
-    if any(marker in lower_line for marker in ['todo', 'fixme', 'deprecated', 'example', 'sample']):
+    # Use word boundaries to avoid false positives (e.g. "pycryptodome" contains "todo")
+    import re as _re
+    if any(_re.search(r'\b' + marker + r'\b', lower_line) for marker in ['todo', 'fixme', 'deprecated', 'example', 'sample']):
         return "LOW", "comment"
 
     # Config files with crypto settings = HIGH (these affect production)
@@ -386,22 +399,105 @@ def _context_risk_multiplier(finding_risk: str, filepath: str, line_content: str
     return finding_risk, "reference"
 
 
-def scan_codebase(path: str) -> Dict:
+def _load_pqcignore(project_root: str) -> List[str]:
+    """Load .pqcignore patterns from project root. Returns list of glob patterns."""
+    ignore_path = os.path.join(project_root, ".pqcignore")
+    if not os.path.isfile(ignore_path):
+        return []
+    patterns = []
+    try:
+        with open(ignore_path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    patterns.append(line)
+    except Exception:
+        pass
+    return patterns
+
+
+def _matches_pqcignore(rel_path: str, patterns: List[str]) -> bool:
+    """Check if a relative path matches any .pqcignore pattern."""
+    for pattern in patterns:
+        if fnmatch.fnmatch(rel_path, pattern):
+            return True
+        # Also check if any path component matches (e.g. "vendor/*" matches "vendor/lib/foo.py")
+        if os.sep != '/':
+            rel_path_posix = rel_path.replace(os.sep, '/')
+        else:
+            rel_path_posix = rel_path
+        if fnmatch.fnmatch(rel_path_posix, pattern):
+            return True
+    return False
+
+
+def _check_file_ignore(lines: List[str], max_lines: int = 10) -> bool:
+    """Check first N lines for # pqc-posture:ignore-file directive."""
+    for line in lines[:max_lines]:
+        stripped = line.strip()
+        if 'pqc-posture:ignore-file' in stripped:
+            return True
+    return False
+
+
+def _check_line_suppression(line: str, algo_name: str) -> bool:
+    """Check if a line has a pqc-posture:ignore comment suppressing this finding.
+
+    Supports:
+      # pqc-posture:ignore        — ignore all findings on this line
+      // pqc-posture:ignore       — same for JS/Go/Java/C
+      # pqc-posture:ignore RSA    — ignore only findings with 'RSA' in algo name
+      // pqc-posture:ignore RSA   — same for JS/Go/Java/C
+
+    Returns True if the finding should be suppressed.
+    """
+    # Look for the suppression marker in the full line (including comments)
+    match = re.search(r'(?:#|//)\s*pqc-posture:ignore\b(.*)', line)
+    if not match:
+        return False
+    filter_part = match.group(1).strip()
+    if not filter_part:
+        # Bare ignore — suppress everything on this line
+        return True
+    # Filter specifies algorithm substring(s) — only suppress if algo matches
+    # Support comma-separated or space-separated filters
+    filters = re.split(r'[,\s]+', filter_part)
+    for f in filters:
+        if f and f.lower() in algo_name.lower():
+            return True
+    return False
+
+
+def scan_codebase(path: str, show_suppressed: bool = False) -> Dict:
     """Full crypto inventory scan with CBOM output."""
     start = time.time()
     findings = []
+    suppressed_findings = []
+    suppressed_count = 0
     files_scanned = 0
     files_with_crypto = set()
     crypto_libs_found = set()
+
+    # Load .pqcignore patterns once at scan start
+    pqcignore_patterns = _load_pqcignore(path)
 
     for root, dirs, files in os.walk(path):
         dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
         for fname in files:
             ext = os.path.splitext(fname)[1].lower()
+            # Handle dotfiles like .env where splitext returns ('', '.env')
+            if not ext and fname.startswith('.'):
+                ext = fname.lower()  # .env → ".env"
             if ext not in SCAN_EXTENSIONS:
                 continue
 
             fpath = os.path.join(root, fname)
+            rel_path = os.path.relpath(fpath, path)
+
+            # Check .pqcignore patterns
+            if pqcignore_patterns and _matches_pqcignore(rel_path, pqcignore_patterns):
+                continue
+
             try:
                 with open(fpath, 'r', errors='ignore') as f:
                     lines = f.readlines()
@@ -409,8 +505,22 @@ def scan_codebase(path: str) -> Dict:
             except Exception:
                 continue
 
+            # Check for file-level ignore directive in first 10 lines
+            if _check_file_ignore(lines):
+                continue
+
+            in_block_comment = False
             for i, line in enumerate(lines, 1):
                 stripped = line.strip()
+
+                # Track C-style block comments /* ... */
+                if '/*' in stripped:
+                    in_block_comment = True
+                if in_block_comment:
+                    if '*/' in stripped:
+                        in_block_comment = False
+                    continue
+
                 if stripped.startswith('#') or stripped.startswith('//') or stripped.startswith('*'):
                     continue
 
@@ -425,11 +535,10 @@ def scan_codebase(path: str) -> Dict:
                 for algo_name, config in CRYPTO_PATTERNS.items():
                     for pattern in config['patterns']:
                         if re.search(pattern, code_part):
-                            rel_path = os.path.relpath(fpath, path)
                             adjusted_risk, context = _context_risk_multiplier(
                                 config['risk'], rel_path, stripped
                             )
-                            findings.append(CryptoFinding(
+                            finding = CryptoFinding(
                                 file=rel_path,
                                 line=i,
                                 algorithm=algo_name,
@@ -441,8 +550,16 @@ def scan_codebase(path: str) -> Dict:
                                 usage=stripped[:120],
                                 migration=config['migration'],
                                 nist_ref=config['nist_ref'],
-                            ))
-                            files_with_crypto.add(rel_path)
+                            )
+                            # Check line-level suppression (use original line, not stripped code_part)
+                            if _check_line_suppression(line, algo_name):
+                                suppressed_count += 1
+                                if show_suppressed:
+                                    suppressed_findings.append(finding)
+                            else:
+                                findings.append(finding)
+                                files_with_crypto.add(rel_path)
+                            break  # one match per algorithm per line — no duplicates
 
                 # Detect crypto library imports
                 for lib_pattern, lib_name in [
@@ -490,7 +607,7 @@ def scan_codebase(path: str) -> Dict:
         "version": 1,
         "metadata": {
             "timestamp": time.strftime('%Y-%m-%dT%H:%M:%SZ'),
-            "tools": [{"name": "PQC Posture Scanner", "version": "0.1.0"}],
+            "tools": [{"name": "PQC Posture Scanner", "version": "0.2.0"}],
             "component": {"name": os.path.basename(path), "type": "application"},
         },
         "cryptoProperties": {
@@ -498,7 +615,7 @@ def scan_codebase(path: str) -> Dict:
                 {
                     "name": algo,
                     "occurrences": count,
-                    "quantumSafe": algo_counts.get(algo, '') != 'BROKEN',
+                    "quantumSafe": CRYPTO_PATTERNS.get(algo, {}).get('quantum_status', 'BROKEN') == 'SAFE',
                 }
                 for algo, count in algo_counts.items()
             ],
@@ -506,11 +623,12 @@ def scan_codebase(path: str) -> Dict:
         },
     }
 
-    return {
+    result_dict = {
         "scan_path": path,
         "files_scanned": files_scanned,
         "files_with_crypto": len(files_with_crypto),
         "total_findings": len(findings),
+        "suppressed_findings": suppressed_count,
         "scan_time_ms": elapsed_ms,
         "risk_score": risk_score,
         "risk_level": "CRITICAL" if risk_score >= 50 else "HIGH" if risk_score >= 25 else "MEDIUM" if risk_score >= 10 else "LOW",
@@ -524,6 +642,7 @@ def scan_codebase(path: str) -> Dict:
         "by_algorithm": dict(algo_counts),
         "crypto_libraries": sorted(crypto_libs_found),
         "findings": [asdict(f) for f in findings],
+        "suppressed": [asdict(f) for f in suppressed_findings] if show_suppressed else [],
         "cbom": cbom,
         "migration_priority": [
             asdict(f) for f in sorted(
@@ -532,6 +651,54 @@ def scan_codebase(path: str) -> Dict:
             )
         ][:20],
     }
+    result_dict["grade"] = grade_result(result_dict)
+    return result_dict
+
+
+GRADE_THRESHOLDS = [
+    (0, "A+"),
+    (5, "A"),
+    (15, "B+"),
+    (25, "B"),
+    (40, "C+"),
+    (50, "C"),
+    (65, "D+"),
+    (80, "D"),
+    (90, "F+"),
+    (100, "F"),
+]
+
+# Ordered from best to worst for comparison
+GRADE_ORDER = ["A+", "A", "B+", "B", "C+", "C", "D+", "D", "F+", "F"]
+
+
+def grade_result(result: dict) -> str:
+    """Convert risk_score to a letter grade.
+
+    - 0: A+ (quantum-safe, zero findings)
+    - 1-5: A (minimal exposure)
+    - 6-15: B+
+    - 16-25: B (low exposure)
+    - 26-40: C+
+    - 41-50: C (moderate exposure)
+    - 51-65: D+
+    - 66-80: D (high exposure)
+    - 81-90: F+
+    - 91-100: F (critical exposure)
+    """
+    score = result.get("risk_score", 0)
+    for threshold, grade in GRADE_THRESHOLDS:
+        if score <= threshold:
+            return grade
+    return "F"
+
+
+def grade_is_worse_or_equal(grade: str, threshold: str) -> bool:
+    """Return True if *grade* is equal to or worse than *threshold*."""
+    try:
+        return GRADE_ORDER.index(grade) >= GRADE_ORDER.index(threshold)
+    except ValueError:
+        return False
 
 
 def print_report(result: Dict):
@@ -540,11 +707,13 @@ def print_report(result: Dict):
     print(f"  PQC POSTURE REPORT — {result['scan_path']}")
     print(f"{'='*70}\n")
 
-    # Risk gauge
+    # Grade + Risk gauge
     score = result['risk_score']
     level = result['risk_level']
+    grade = result.get('grade', grade_result(result))
     bar_len = score // 2
     bar = '#' * bar_len + '-' * (50 - bar_len)
+    print(f"  QUANTUM RISK GRADE: {grade} ({score}/100)")
     print(f"  QUANTUM RISK SCORE: {score}/100 [{level}]")
     print(f"  [{bar}]")
     print()
@@ -553,6 +722,9 @@ def print_report(result: Dict):
     print(f"  Files scanned:       {result['files_scanned']}")
     print(f"  Files with crypto:   {result['files_with_crypto']}")
     print(f"  Total findings:      {result['total_findings']}")
+    suppressed = result.get('suppressed_findings', 0)
+    if suppressed:
+        print(f"  Suppressed findings: {suppressed}")
     print(f"  Scan time:           {result['scan_time_ms']}ms")
     print()
 
@@ -631,6 +803,99 @@ def print_report(result: Dict):
     else:
         print(f"  VERDICT: LOW exposure. Continue monitoring.")
     print(f"{'='*70}\n")
+
+
+def diff_results(current: dict, baseline: dict) -> dict:
+    """Compare current scan results to a baseline (previous scan).
+
+    Matches findings by (file, line, algorithm) tuple. Handles file renames
+    gracefully by also matching on (basename, algorithm) when a file path
+    changes but the filename stays the same.
+
+    Args:
+        current: Result dict from the current scan.
+        baseline: Result dict from a previous scan (loaded from JSON).
+
+    Returns:
+        Dict with keys: new_findings, fixed_findings, unchanged_count,
+        current_total, baseline_total, new_count, fixed_count.
+    """
+    def _finding_key(f):
+        """Primary key: (file, line, algorithm)."""
+        return (f.get("file", ""), f.get("line", 0), f.get("algorithm", ""))
+
+    def _basename_key(f):
+        """Fallback key for detecting renames: (basename, line, algorithm)."""
+        filepath = f.get("file", "")
+        basename = filepath.rsplit("/", 1)[-1] if "/" in filepath else filepath
+        return (basename, f.get("line", 0), f.get("algorithm", ""))
+
+    current_findings = current.get("findings", [])
+    baseline_findings = baseline.get("findings", [])
+
+    # Build sets of keys
+    current_keys = {_finding_key(f) for f in current_findings}
+    baseline_keys = {_finding_key(f) for f in baseline_findings}
+
+    # Exact matches = unchanged
+    unchanged_keys = current_keys & baseline_keys
+
+    # Candidates for new/fixed (not exact match)
+    maybe_new_keys = current_keys - baseline_keys
+    maybe_fixed_keys = baseline_keys - current_keys
+
+    # Handle renames: if a finding moved files but basename+line+algo match,
+    # treat it as unchanged (not new + fixed)
+    maybe_new_by_base = {}
+    for f in current_findings:
+        k = _finding_key(f)
+        if k in maybe_new_keys:
+            bk = _basename_key(f)
+            maybe_new_by_base.setdefault(bk, []).append(k)
+
+    maybe_fixed_by_base = {}
+    for f in baseline_findings:
+        k = _finding_key(f)
+        if k in maybe_fixed_keys:
+            bk = _basename_key(f)
+            maybe_fixed_by_base.setdefault(bk, []).append(k)
+
+    # Find rename matches
+    rename_matched_new = set()
+    rename_matched_fixed = set()
+    for bk in maybe_new_by_base:
+        if bk in maybe_fixed_by_base:
+            # Match one-to-one
+            new_list = maybe_new_by_base[bk]
+            fixed_list = maybe_fixed_by_base[bk]
+            pairs = min(len(new_list), len(fixed_list))
+            for i in range(pairs):
+                rename_matched_new.add(new_list[i])
+                rename_matched_fixed.add(fixed_list[i])
+
+    # Final sets
+    truly_new_keys = maybe_new_keys - rename_matched_new
+    truly_fixed_keys = maybe_fixed_keys - rename_matched_fixed
+    total_unchanged = len(unchanged_keys) + len(rename_matched_new)
+
+    # Build finding lists
+    new_findings = [f for f in current_findings if _finding_key(f) in truly_new_keys]
+    fixed_findings = [f for f in baseline_findings if _finding_key(f) in truly_fixed_keys]
+
+    # Sort by risk severity
+    risk_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+    new_findings.sort(key=lambda x: risk_order.get(x.get("risk", "LOW"), 3))
+    fixed_findings.sort(key=lambda x: risk_order.get(x.get("risk", "LOW"), 3))
+
+    return {
+        "new_findings": new_findings,
+        "fixed_findings": fixed_findings,
+        "new_count": len(new_findings),
+        "fixed_count": len(fixed_findings),
+        "unchanged_count": total_unchanged,
+        "current_total": len(current_findings),
+        "baseline_total": len(baseline_findings),
+    }
 
 
 if __name__ == "__main__":
